@@ -3,6 +3,7 @@
 </div>
 
 Nhelv(ネルフ) は、Discord 上で会話・ツール実行・VOICEVOX 読み上げを統合して動かす Rust 製の bot です。
+
 Observer-rust の後継プロジェクトとして、スタンドアローン動作を前提に設計されており、OpenAI API を利用した会話機能を中心に、様々なツールや機能を提供します。
 
 ## 機能
@@ -18,21 +19,9 @@ Observer-rust の後継プロジェクトとして、スタンドアローン動
 
 ## セットアップ
 
-1. 依存ツールを準備
+1. リリースからバイナリをダウンロード
 
-```powershell
-rustup toolchain install stable
-rustup default stable
-```
-
-2. リポジトリを取得
-
-```powershell
-git clone <this-repo-url>
-cd observer-rust
-```
-
-3. `.env` を作成
+2. `.env` を作成
 
 ```dotenv
 # required
@@ -52,19 +41,9 @@ VOICEVOX_VVM_DIR=voicevox_core/models/vvms
 VOICEVOX_ONNXRUNTIME_FILENAME=voicevox_core/onnxruntime/lib/voicevox_onnxruntime.dll
 ```
 
-4. 起動
+3. 起動
 
-```powershell
-cargo run
-```
-
-本番寄り実行:
-
-```powershell
-cargo run --release
-```
-
-## 設定の考え方
+## 設定
 
 現在の実装では、環境変数（`.env`）から読み込みます。
 `DISCORD_TOKEN` と `OPENAI_API_KEY` は未設定だと起動時にエラーになります。
@@ -101,6 +80,8 @@ VC / TTS:
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+fmtはやってない。
+
 ## トラブルシュート
 
 - `DISCORD_TOKEN must be set`:
@@ -115,3 +96,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 - KaTeX font のライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) に記載しています。
 - `KaTeX_font` ディレクトリを再配布する場合は、上記ライセンス表記を同梱してください。
 
+ダウンロードコンテンツはREADMEを含むのでそちらを参照。
+
+## Thx
+名前考えてくれたt3tra-devさんとVCの機能アイデア上げてくれたtabosanさんに感謝
