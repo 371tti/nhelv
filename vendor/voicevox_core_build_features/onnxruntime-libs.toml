@@ -30,7 +30,7 @@ lib-sha256 = "efcce3328c9ce0a718de02120afe4dbfe44c7e8d2349139d7c21d44e604b0335"
 
 [targets."x86_64-unknown-linux-gnu"]
 artifact-name = "onnxruntime-linux-x64"
-lib-sha256 = "e73a8cfc1ca65d71e9006ec6aaa909d0dbe1c4e64077d32979337cf333f47bfa"
+lib-sha256 = "2ebafae642d0b62efe8562d1ee6037ff6a29e8f6e996b4a444bfd777d8c0c3ba"
 
 [targets."x86_64-unknown-linux-musl"]
 artifact-name = "onnxruntime-linux-x64"

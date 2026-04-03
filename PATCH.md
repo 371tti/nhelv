@@ -1,4 +1,4 @@
-# VOICEVOX Issue Draft（Nelfie 統合時の問題）
+# VOICEVOX Issue Draft（feature flag の link-onnxruntime のやつが更新されてないねってやつ）
 
 ## 概要
 `voicevox_core` を以下の構成で使用すると:
@@ -49,25 +49,12 @@
      （または既存の命名規則に沿った `voicevox_` プレフィックス付きのアーティファクト名）
 2. リンク処理では `voicevox_onnxruntime` ライブラリ名を優先して使用する。
 3. `vv_bin` を読み込もうとしているのに非 VOICEVOX ORT が検出された場合、明確な警告またはエラーを出す。
-4. `x86_64-unknown-linux-musl` 向けの target metadata を追加する。
 
-## 追加のビルドメタデータ不足
-`onnxruntime-libs.toml` には `x86_64-unknown-linux-musl` が含まれていませんでした。
-
-提案:
-- target entry を追加する。
-- もし一時的に `lib-sha256` が未確定なら、即 hard fail ではなく明示的な warning を出して許容する、もしくはその target 向けの公式ハッシュを公開する。
 
 ## このリポジトリで適用したローカルパッチ
 - vendor した `voicevox_core_build_features` に対して以下を修正:
   - ダウンロード先を `voicevox_onnxruntime-*` の release/tag 経路に変更
   - リンク名を `voicevox_onnxruntime` に変更
-  - `lib-sha256` を optional に対応
-  - `x86_64-unknown-linux-musl` の target entry を追加
 - このパッチ適用後、preload は成功し、モデルも正常にロードされた
   - `model_count=25`
   - `style_count=127`
-
-## Issue タイトル候補
-- `link-onnxruntime + buildtime-download-onnxruntime が非 VOICEVOX ORT を取得して vv_bin モデル読み込みを壊す`
-- `voicevox_core_build_features: onnxruntime-libs.toml に x86_64-unknown-linux-musl が存在しない`
