@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Cursor,
     path::{Path, PathBuf},
     time::Duration,
@@ -23,22 +23,17 @@ const OPEN_JTALK_REPO: &str = "r9y9/open_jtalk";
 const OPEN_JTALK_TAG: &str = "v1.11.1";
 const OPEN_JTALK_ASSET_NAME: &str = "open_jtalk_dic_utf_8-1.11.tar.gz";
 
+const ONNXRUNTIME_BUILDER_REPO: &str = "VOICEVOX/onnxruntime-builder";
+
 const VOICEVOX_VVM_REPO: &str = "VOICEVOX/voicevox_vvm";
 const MODELS_DIR_NAME: &str = "vvms";
 const MODELS_TERMS_FILE: &str = "TERMS.txt";
 const MODELS_README_FILE: &str = "README.txt";
-const SUPPORTED_VVM_MAJOR: u64 = 0;
-const SUPPORTED_VVM_MINOR: u64 = 16;
-const VVM_RELEASE_MARKER_FILE: &str = ".nelfie_vvm_release_tag";
 
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
     assets: Vec<GithubAsset>,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    prerelease: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,141 +113,9 @@ impl CoreRuntime {
         Self::github_api_get(&url).await
     }
 
-    async fn fetch_releases(repo: &str) -> Result<Vec<GithubRelease>, String> {
-        let url = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
+    async fn fetch_latest_release(repo: &str) -> Result<GithubRelease, String> {
+        let url = format!("https://api.github.com/repos/{repo}/releases/latest");
         Self::github_api_get(&url).await
-    }
-
-    fn parse_release_semver(tag_name: &str) -> Option<(u64, u64, u64)> {
-        let normalized = tag_name.trim().trim_start_matches('v');
-        let stable = normalized.split('-').next().unwrap_or(normalized);
-
-        let mut parts = stable.split('.');
-        let major = parts.next()?.parse::<u64>().ok()?;
-        let minor = parts.next()?.parse::<u64>().ok()?;
-        let patch = parts.next()?.parse::<u64>().ok()?;
-
-        if parts.next().is_some() {
-            return None;
-        }
-
-        Some((major, minor, patch))
-    }
-
-    async fn fetch_latest_supported_vvm_release(repo: &str) -> Result<GithubRelease, String> {
-        let releases = Self::fetch_releases(repo).await?;
-
-        let mut selected: Option<((u64, u64, u64), GithubRelease)> = None;
-        for release in releases {
-            if release.draft || release.prerelease {
-                continue;
-            }
-
-            let Some(version) = Self::parse_release_semver(&release.tag_name) else {
-                continue;
-            };
-
-            if version.0 != SUPPORTED_VVM_MAJOR || version.1 != SUPPORTED_VVM_MINOR {
-                continue;
-            }
-
-            if selected
-                .as_ref()
-                .map(|(best, _)| version > *best)
-                .unwrap_or(true)
-            {
-                selected = Some((version, release));
-            }
-        }
-
-        selected.map(|(_, release)| release).ok_or_else(|| {
-            format!(
-                "no compatible VVM release found in '{}': expected '{}.{}.*'",
-                repo, SUPPORTED_VVM_MAJOR, SUPPORTED_VVM_MINOR
-            )
-        })
-    }
-
-    fn has_extension(path: &Path, extension: &str) -> bool {
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case(extension))
-            .unwrap_or(false)
-    }
-
-    fn collect_files_with_extension(
-        dir: &Path,
-        extension: &str,
-        dir_label: &str,
-    ) -> Result<Vec<PathBuf>, String> {
-        let mut files = Vec::new();
-
-        for entry in std::fs::read_dir(dir).map_err(|e| {
-            format!(
-                "failed to read {} directory '{}': {e}",
-                dir_label,
-                dir.display()
-            )
-        })? {
-            let entry = entry.map_err(|e| {
-                format!(
-                    "failed to read an entry in {} directory '{}': {e}",
-                    dir_label,
-                    dir.display()
-                )
-            })?;
-
-            let path = entry.path();
-            if Self::has_extension(&path, extension) {
-                files.push(path);
-            }
-        }
-
-        files.sort();
-        Ok(files)
-    }
-
-    fn has_file_with_extension(
-        dir: &Path,
-        extension: &str,
-        dir_label: &str,
-    ) -> Result<bool, String> {
-        if !dir.is_dir() {
-            return Ok(false);
-        }
-
-        for entry in std::fs::read_dir(dir).map_err(|e| {
-            format!(
-                "failed to read {} directory '{}': {e}",
-                dir_label,
-                dir.display()
-            )
-        })? {
-            let entry = entry.map_err(|e| {
-                format!(
-                    "failed to read an entry in {} directory '{}': {e}",
-                    dir_label,
-                    dir.display()
-                )
-            })?;
-
-            if Self::has_extension(&entry.path(), extension) {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
-
-    fn remove_existing_vvm_files(vvm_dir: &Path) -> Result<usize, String> {
-        let vvm_files = Self::collect_files_with_extension(vvm_dir, "vvm", "VVM")?;
-
-        for path in &vvm_files {
-            std::fs::remove_file(path)
-                .map_err(|e| format!("failed to remove old VVM file '{}': {e}", path.display()))?;
-        }
-
-        Ok(vvm_files.len())
     }
 
     async fn download_asset_bytes(url: &str) -> Result<Vec<u8>, String> {
@@ -292,28 +155,450 @@ impl CoreRuntime {
             .map_err(|e| format!("failed to read downloaded asset bytes: {e}"))
     }
 
-    async fn write_release_asset_if_exists(
-        release: &GithubRelease,
-        asset_name: &str,
-        out_path: &Path,
-        label: &str,
-    ) -> Result<bool, String> {
-        let Some(asset) = release.assets.iter().find(|a| a.name == asset_name) else {
-            return Ok(false);
+    fn is_archive_asset(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower.ends_with(".tgz") || lower.ends_with(".tar.gz")
+    }
+
+    fn strip_first_archive_component(raw_path: &Path) -> Result<PathBuf, String> {
+        let mut stripped = PathBuf::new();
+
+        for component in raw_path.components().skip(1) {
+            match component {
+                std::path::Component::Normal(value) => stripped.push(value),
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "archive entry contains unsupported path component: '{}'",
+                        raw_path.display()
+                    ));
+                }
+            }
+        }
+
+        Ok(stripped)
+    }
+
+    fn extract_tgz_strip_first_dir(archive: &[u8], output_root: &Path) -> Result<(), String> {
+        let mut tar = tar::Archive::new(GzDecoder::new(Cursor::new(archive)));
+
+        let entries = tar
+            .entries()
+            .map_err(|e| format!("failed to read tgz entries: {e}"))?;
+
+        for entry in entries {
+            let mut entry = entry.map_err(|e| format!("failed to read tgz entry: {e}"))?;
+
+            let raw_path = entry
+                .path()
+                .map_err(|e| format!("failed to read tgz entry path: {e}"))?
+                .into_owned();
+
+            let stripped = Self::strip_first_archive_component(&raw_path)?;
+            if stripped.as_os_str().is_empty() {
+                continue;
+            }
+
+            let dst = output_root.join(stripped);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "failed to create extraction directory '{}': {e}",
+                        parent.display()
+                    )
+                })?;
+            }
+
+            entry
+                .unpack(&dst)
+                .map_err(|e| format!("failed to unpack tgz entry to '{}': {e}", dst.display()))?;
+        }
+
+        Ok(())
+    }
+
+    fn try_find_asset_by_prefix<'a>(
+        release: &'a GithubRelease,
+        prefix: &str,
+        excluded_contains: &[&str],
+    ) -> Option<&'a GithubAsset> {
+        let prefix_lower = prefix.to_ascii_lowercase();
+        release.assets.iter().find(|asset| {
+            if !Self::is_archive_asset(&asset.name) {
+                return false;
+            }
+
+            let name = asset.name.to_ascii_lowercase();
+            if !name.starts_with(&prefix_lower) {
+                return false;
+            }
+
+            !excluded_contains.iter().any(|needle| name.contains(needle))
+        })
+    }
+
+    fn onnxruntime_asset_candidates(release: &GithubRelease) -> Vec<String> {
+        release
+            .assets
+            .iter()
+            .filter(|asset| Self::is_archive_asset(&asset.name))
+            .map(|asset| asset.name.clone())
+            .collect()
+    }
+
+    fn is_managed_onnxruntime_root(path: &Path) -> bool {
+        let mut has_voicevox_core = false;
+        let mut tail_is_onnxruntime = false;
+
+        for component in path.components() {
+            if let std::path::Component::Normal(value) = component {
+                if value == "voicevox_core" {
+                    has_voicevox_core = true;
+                }
+                tail_is_onnxruntime = value == "onnxruntime";
+            }
+        }
+
+        has_voicevox_core && tail_is_onnxruntime
+    }
+
+    fn env_preview(name: &str, max_len: usize) -> String {
+        match std::env::var(name) {
+            Ok(value) => {
+                if value.len() <= max_len {
+                    value
+                } else {
+                    format!(
+                        "{}...(truncated, total_len={})",
+                        &value[..max_len],
+                        value.len()
+                    )
+                }
+            }
+            Err(err) => format!("<{}>", err),
+        }
+    }
+
+    fn path_status(path: &Path) -> String {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                let kind = if meta.file_type().is_symlink() {
+                    "symlink"
+                } else if meta.is_dir() {
+                    "dir"
+                } else if meta.is_file() {
+                    "file"
+                } else {
+                    "other"
+                };
+
+                let link_target = if meta.file_type().is_symlink() {
+                    std::fs::read_link(path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|e| format!("<readlink_error:{}>", e))
+                } else {
+                    "-".to_string()
+                };
+
+                let canonical = std::fs::canonicalize(path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("<canonicalize_error:{}>", e));
+
+                format!(
+                    "exists(kind={}, size={}, readonly={}, canonical='{}', symlink_target='{}')",
+                    kind,
+                    meta.len(),
+                    meta.permissions().readonly(),
+                    canonical,
+                    link_target
+                )
+            }
+            Err(err) => format!("missing(metadata_error={})", err),
+        }
+    }
+
+    fn dir_preview(dir: &Path, limit: usize) -> String {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => return format!("<read_dir_error:{}>", err),
         };
 
-        let bytes = Self::download_asset_bytes(&asset.browser_download_url).await?;
-        std::fs::write(out_path, bytes)
-            .map_err(|e| format!("failed to write {} '{}': {e}", label, out_path.display()))?;
-        Ok(true)
+        let mut names = Vec::new();
+        for entry in entries.flatten().take(limit) {
+            let path = entry.path();
+            let mut name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<non-utf8>")
+                .to_string();
+
+            if path.is_dir() {
+                name.push('/');
+            }
+            names.push(name);
+        }
+
+        if names.is_empty() {
+            "<empty>".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    fn build_onnxruntime_failure_diagnostics(
+        config: &VoiceCoreConfig,
+        candidates: &[String],
+    ) -> String {
+        let configured_path = PathBuf::from(&config.onnxruntime_filename);
+        let lib_dir = configured_path.parent().map(Path::to_path_buf);
+        let onnxruntime_root = lib_dir
+            .as_deref()
+            .and_then(|dir| dir.parent())
+            .map(Path::to_path_buf);
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("<cwd_error:{}>", e));
+
+        let lib_dir_preview = lib_dir
+            .as_deref()
+            .map(|dir| Self::dir_preview(dir, 20))
+            .unwrap_or_else(|| "<none>".to_string());
+        let root_preview = onnxruntime_root
+            .as_deref()
+            .map(|dir| Self::dir_preview(dir, 20))
+            .unwrap_or_else(|| "<none>".to_string());
+
+        format!(
+            "cwd='{}'; configured='{}' ({}) ; lib_dir='{}' ({}); root='{}' ({}); candidates=[{}]; LD_LIBRARY_PATH='{}'; PATH='{}'",
+            cwd,
+            configured_path.display(),
+            Self::path_status(&configured_path),
+            lib_dir
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            lib_dir_preview,
+            onnxruntime_root
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            root_preview,
+            candidates.join(", "),
+            Self::env_preview("LD_LIBRARY_PATH", 400),
+            Self::env_preview("PATH", 400)
+        )
+    }
+
+    fn select_onnxruntime_asset_name(release: &GithubRelease) -> Option<String> {
+        let picked = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("windows", "x86_64") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-win-x64-dml-", &[])
+                    .or_else(|| {
+                        Self::try_find_asset_by_prefix(
+                            release,
+                            "voicevox_onnxruntime-win-x64-",
+                            &["-dml-"],
+                        )
+                    })
+            }
+            ("windows", "x86") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-win-x86-", &[])
+            }
+            ("linux", "x86_64") => {
+                // Linux x64 はまずCPU版を優先する。
+                // ここを単純 starts_with("...linux-x64-") にすると "...linux-x64-cuda-"
+                // までマッチしてしまい、CUDA非対応環境で初期化に失敗しやすい。
+                Self::try_find_asset_by_prefix(
+                    release,
+                    "voicevox_onnxruntime-linux-x64-",
+                    &["-cuda-"],
+                )
+                .or_else(|| {
+                    Self::try_find_asset_by_prefix(
+                        release,
+                        "voicevox_onnxruntime-linux-x64-cuda-",
+                        &[],
+                    )
+                })
+            }
+            ("linux", "aarch64") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-linux-arm64-", &[])
+            }
+            ("macos", "x86_64") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-osx-x86_64-", &[])
+            }
+            ("macos", "aarch64") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-osx-arm64-", &[])
+            }
+            _ => Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-", &[]),
+        };
+
+        picked.map(|asset| asset.name.clone())
+    }
+
+    async fn ensure_voicevox_onnxruntime(
+        config: &VoiceCoreConfig,
+        force_refresh: bool,
+    ) -> Result<(), String> {
+        let configured_path = PathBuf::from(&config.onnxruntime_filename);
+        if configured_path.is_file() && !force_refresh {
+            return Ok(());
+        }
+
+        let lib_dir = configured_path.parent().ok_or_else(|| {
+            format!(
+                "invalid ONNX Runtime path '{}': parent directory is missing",
+                configured_path.display()
+            )
+        })?;
+
+        let onnxruntime_root = lib_dir.parent().ok_or_else(|| {
+            format!(
+                "invalid ONNX Runtime path '{}': expected '<root>/lib/<dll>'",
+                configured_path.display()
+            )
+        })?;
+
+        if force_refresh && onnxruntime_root.exists() {
+            if Self::is_managed_onnxruntime_root(onnxruntime_root) {
+                std::fs::remove_dir_all(onnxruntime_root).map_err(|e| {
+                    format!(
+                        "failed to remove ONNX Runtime directory '{}' before refresh: {e}",
+                        onnxruntime_root.display()
+                    )
+                })?;
+            } else {
+                warn!(
+                    "skip ONNX Runtime force-refresh cleanup for unmanaged path '{}'",
+                    onnxruntime_root.display()
+                );
+                return Err(format!(
+                    "refusing force refresh for unmanaged ONNX Runtime path '{}'",
+                    onnxruntime_root.display()
+                ));
+            }
+        }
+
+        std::fs::create_dir_all(onnxruntime_root).map_err(|e| {
+            format!(
+                "failed to create ONNX Runtime root directory '{}': {e}",
+                onnxruntime_root.display()
+            )
+        })?;
+
+        info!(
+            "VOICEVOX ONNX Runtime {} at '{}'; downloading from '{}'",
+            if force_refresh {
+                "refresh requested"
+            } else {
+                "not found"
+            },
+            configured_path.display(),
+            ONNXRUNTIME_BUILDER_REPO
+        );
+
+        let release = Self::fetch_latest_release(ONNXRUNTIME_BUILDER_REPO).await?;
+        let asset_name = Self::select_onnxruntime_asset_name(&release).ok_or_else(|| {
+            let available = Self::onnxruntime_asset_candidates(&release);
+            format!(
+                "no matching ONNX Runtime archive for current platform in release '{}'. os='{}' arch='{}' available_assets={:?}",
+                release.tag_name,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                available
+            )
+        })?;
+
+        let asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == asset_name)
+            .ok_or_else(|| {
+                format!(
+                    "failed to find asset '{}' in release '{}'",
+                    asset_name, release.tag_name
+                )
+            })?;
+
+        let archive = Self::download_asset_bytes(&asset.browser_download_url).await?;
+        Self::extract_tgz_strip_first_dir(&archive, onnxruntime_root)?;
+
+        if !configured_path.is_file() {
+            return Err(format!(
+                "ONNX Runtime download finished but '{}' is still missing",
+                configured_path.display()
+            ));
+        }
+
+        info!(
+            "VOICEVOX ONNX Runtime downloaded successfully (tag={}, asset={})",
+            release.tag_name, asset_name
+        );
+
+        Ok(())
     }
 
     fn has_open_jtalk_dictionary(dict_dir: &Path) -> Result<bool, String> {
-        Self::has_file_with_extension(dict_dir, "dic", "dict")
+        if !dict_dir.is_dir() {
+            return Ok(false);
+        }
+
+        let mut has_dic = false;
+        for entry in std::fs::read_dir(dict_dir).map_err(|e| {
+            format!(
+                "failed to read dict directory '{}': {e}",
+                dict_dir.display()
+            )
+        })? {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "failed to read an entry in dict directory '{}': {e}",
+                    dict_dir.display()
+                )
+            })?;
+
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("dic"))
+                .unwrap_or(false)
+            {
+                has_dic = true;
+                break;
+            }
+        }
+
+        Ok(has_dic)
     }
 
     fn has_vvm_assets(vvm_dir: &Path) -> Result<bool, String> {
-        Self::has_file_with_extension(vvm_dir, "vvm", "VVM")
+        if !vvm_dir.is_dir() {
+            return Ok(false);
+        }
+
+        for entry in std::fs::read_dir(vvm_dir)
+            .map_err(|e| format!("failed to read VVM directory '{}': {e}", vvm_dir.display()))?
+        {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "failed to read an entry in VVM directory '{}': {e}",
+                    vvm_dir.display()
+                )
+            })?;
+
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("vvm"))
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     async fn ensure_open_jtalk_dictionary(dict_dir: &Path) -> Result<(), String> {
@@ -377,6 +662,10 @@ impl CoreRuntime {
     }
 
     async fn ensure_vvm_models(vvm_dir: &Path) -> Result<(), String> {
+        if Self::has_vvm_assets(vvm_dir)? {
+            return Ok(());
+        }
+
         std::fs::create_dir_all(vvm_dir).map_err(|e| {
             format!(
                 "failed to create VVM directory '{}': {e}",
@@ -385,53 +674,13 @@ impl CoreRuntime {
         })?;
 
         let models_root = vvm_dir.parent().unwrap_or(vvm_dir);
-        let marker_path = models_root.join(VVM_RELEASE_MARKER_FILE);
-        let has_local_assets = Self::has_vvm_assets(vvm_dir)?;
 
-        let release = match Self::fetch_latest_supported_vvm_release(VOICEVOX_VVM_REPO).await {
-            Ok(release) => release,
-            Err(e) => {
-                if has_local_assets {
-                    warn!(
-                        "failed to fetch compatible VVM release metadata: {}. using existing local VVMs under '{}'",
-                        e,
-                        vvm_dir.display()
-                    );
-                    return Ok(());
-                }
-                return Err(e);
-            }
-        };
+        info!(
+            "VVM assets not found at '{}'; downloading from GitHub release assets",
+            vvm_dir.display()
+        );
 
-        let current_tag = std::fs::read_to_string(&marker_path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        if has_local_assets && current_tag.as_deref() == Some(release.tag_name.as_str()) {
-            return Ok(());
-        }
-
-        if has_local_assets {
-            info!(
-                "refreshing VVM assets in '{}' to compatible release '{}' (previous marker={})",
-                vvm_dir.display(),
-                release.tag_name,
-                current_tag.unwrap_or_else(|| "<none>".to_string())
-            );
-
-            let removed = Self::remove_existing_vvm_files(vvm_dir)?;
-            if removed > 0 {
-                info!("removed {} old VVM file(s) before refresh", removed);
-            }
-        } else {
-            info!(
-                "VVM assets not found at '{}'; downloading compatible release '{}'",
-                vvm_dir.display(),
-                release.tag_name
-            );
-        }
-
+        let release = Self::fetch_latest_release(VOICEVOX_VVM_REPO).await?;
         let mut downloaded = 0usize;
 
         for asset in &release.assets {
@@ -447,27 +696,28 @@ impl CoreRuntime {
             downloaded += 1;
         }
 
-        let readme_path = models_root.join(MODELS_README_FILE);
-        Self::write_release_asset_if_exists(
-            &release,
-            MODELS_README_FILE,
-            &readme_path,
-            "models README",
-        )
-        .await?;
+        if let Some(readme) = release.assets.iter().find(|a| a.name == MODELS_README_FILE) {
+            let bytes = Self::download_asset_bytes(&readme.browser_download_url).await?;
+            let out_path = models_root.join(MODELS_README_FILE);
+            std::fs::write(&out_path, bytes).map_err(|e| {
+                format!(
+                    "failed to write models README '{}': {e}",
+                    out_path.display()
+                )
+            })?;
+        }
 
-        let terms_path = models_root.join(MODELS_TERMS_FILE);
-        Self::write_release_asset_if_exists(
-            &release,
-            MODELS_TERMS_FILE,
-            &terms_path,
-            "models terms",
-        )
-        .await?;
+        if let Some(terms) = release.assets.iter().find(|a| a.name == MODELS_TERMS_FILE) {
+            let bytes = Self::download_asset_bytes(&terms.browser_download_url).await?;
+            let out_path = models_root.join(MODELS_TERMS_FILE);
+            std::fs::write(&out_path, bytes).map_err(|e| {
+                format!("failed to write models terms '{}': {e}", out_path.display())
+            })?;
+        }
 
         if downloaded == 0 {
             return Err(format!(
-                "no .vvm assets were found in compatible release '{}' of '{}'",
+                "no .vvm assets were found in latest release '{}' of '{}'",
                 release.tag_name, VOICEVOX_VVM_REPO
             ));
         }
@@ -484,13 +734,6 @@ impl CoreRuntime {
             release.tag_name, downloaded
         );
 
-        std::fs::write(&marker_path, format!("{}\n", release.tag_name)).map_err(|e| {
-            format!(
-                "failed to write VVM release marker '{}': {e}",
-                marker_path.display()
-            )
-        })?;
-
         Ok(())
     }
 
@@ -498,6 +741,7 @@ impl CoreRuntime {
         let dict_dir = PathBuf::from(&config.open_jtalk_dict_dir);
         let vvm_dir = PathBuf::from(&config.vvm_dir);
 
+        Self::ensure_voicevox_onnxruntime(config, false).await?;
         Self::ensure_open_jtalk_dictionary(&dict_dir).await?;
         Self::ensure_vvm_models(&vvm_dir).await?;
 
@@ -515,6 +759,47 @@ impl CoreRuntime {
         }
 
         Ok(())
+    }
+
+    async fn try_load_onnxruntime_candidates(
+        candidates: &[String],
+    ) -> Result<&'static Onnxruntime, Vec<String>> {
+        let mut tried = Vec::new();
+
+        for (idx, candidate) in candidates.iter().enumerate() {
+            match Onnxruntime::load_once().filename(candidate).perform().await {
+                Ok(ort) => {
+                    if idx > 0 {
+                        warn!(
+                            "ONNX Runtime init fallback succeeded with filename='{}'",
+                            candidate
+                        );
+                    }
+                    return Ok(ort);
+                }
+                Err(e) => {
+                    let path = PathBuf::from(candidate);
+                    let file_hint = if path.components().count() > 1 || path.is_absolute() {
+                        match std::fs::metadata(&path) {
+                            Ok(meta) => {
+                                format!(
+                                    "exists(size={}, readonly={})",
+                                    meta.len(),
+                                    meta.permissions().readonly()
+                                )
+                            }
+                            Err(err) => format!("metadata_error={}", err),
+                        }
+                    } else {
+                        "search_path_candidate".to_string()
+                    };
+
+                    tried.push(format!("{} [{}] => {}", candidate, file_hint, e));
+                }
+            }
+        }
+
+        Err(tried)
     }
 
     fn parse_acceleration_mode(mode: &str) -> AccelerationMode {
@@ -542,21 +827,94 @@ impl CoreRuntime {
             return Ok(existing);
         }
 
+        let mut candidates = Vec::new();
+
         if !config.onnxruntime_filename.trim().is_empty() {
-            info!(
-                "VOICEVOX_ONNXRUNTIME_FILENAME is ignored because voicevox_core is built with 'link-onnxruntime'"
-            );
+            candidates.push(config.onnxruntime_filename.clone());
         }
 
-        Onnxruntime::init_once().await.map_err(|e| {
-            format!(
-                "failed to initialize ONNX Runtime in link mode: {} (os='{}', arch='{}', configured='{}')",
-                e,
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                config.onnxruntime_filename
-            )
-        })
+        let default_versioned = Onnxruntime::LIB_VERSIONED_FILENAME.to_string();
+        if !candidates.iter().any(|c| c == &default_versioned) {
+            candidates.push(default_versioned);
+        }
+
+        let default_unversioned = Onnxruntime::LIB_UNVERSIONED_FILENAME.to_string();
+        if !candidates.iter().any(|c| c == &default_unversioned) {
+            candidates.push(default_unversioned);
+        }
+
+        let diagnostic = Self::build_onnxruntime_failure_diagnostics(config, &candidates);
+
+        match Self::try_load_onnxruntime_candidates(&candidates).await {
+            Ok(ort) => return Ok(ort),
+            Err(initial_errors) => {
+                let mut refresh_result = "not_attempted".to_string();
+                let mut refresh_retry_errors = Vec::new();
+
+                if std::env::consts::OS == "linux" {
+                    let configured_path = PathBuf::from(&config.onnxruntime_filename);
+                    let onnxruntime_root = configured_path
+                        .parent()
+                        .and_then(|lib_dir| lib_dir.parent())
+                        .map(Path::to_path_buf);
+
+                    let can_force_refresh = onnxruntime_root
+                        .as_deref()
+                        .map(Self::is_managed_onnxruntime_root)
+                        .unwrap_or(false);
+
+                    warn!(
+                        "ONNX Runtime init failed on Linux. candidates={} force_refresh_allowed={} root={}",
+                        candidates.join(", "),
+                        can_force_refresh,
+                        onnxruntime_root
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string())
+                    );
+
+                    if can_force_refresh {
+                        match Self::ensure_voicevox_onnxruntime(config, true).await {
+                            Ok(()) => {
+                                match Self::try_load_onnxruntime_candidates(&candidates).await {
+                                    Ok(ort) => {
+                                        warn!(
+                                            "ONNX Runtime init succeeded after forced asset refresh on Linux"
+                                        );
+                                        return Ok(ort);
+                                    }
+                                    Err(retry_errors) => {
+                                        refresh_result =
+                                            "refresh_download_ok_but_retry_failed".to_string();
+                                        refresh_retry_errors = retry_errors;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                refresh_result = format!("refresh_download_failed(error={})", err);
+                            }
+                        }
+                    } else {
+                        refresh_result = "refresh_skipped_unmanaged_path".to_string();
+                    }
+                }
+
+                return Err(format!(
+                    "failed to initialize ONNX Runtime (os='{}', arch='{}', configured='{}', checked candidates: {}, refresh_result='{}', refresh_retry_errors='{}', diagnostics={})",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    config.onnxruntime_filename,
+                    initial_errors.join(" | "),
+                    refresh_result,
+                    if refresh_retry_errors.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        refresh_retry_errors.join(" | ")
+                    },
+                    diagnostic
+                ));
+            }
+        }
     }
 
     fn discover_vvm_files(vvm_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -573,7 +931,30 @@ impl CoreRuntime {
             ));
         }
 
-        let files = Self::collect_files_with_extension(vvm_dir, "vvm", "VVM")?;
+        let mut files = Vec::new();
+        let entries = std::fs::read_dir(vvm_dir)
+            .map_err(|e| format!("failed to read VVM directory '{}': {e}", vvm_dir.display()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "failed to read an entry in VVM directory '{}': {e}",
+                    vvm_dir.display()
+                )
+            })?;
+
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("vvm"))
+                .unwrap_or(false)
+            {
+                files.push(path);
+            }
+        }
+
+        files.sort();
 
         if files.is_empty() {
             return Err(format!("no .vvm files found under '{}'", vvm_dir.display()));
@@ -664,21 +1045,11 @@ impl CoreRuntime {
 
         let mut discovered = Vec::<DiscoveredModel>::new();
         let mut version_counts = HashMap::<String, usize>::new();
-        let mut metadata_open_failed = 0usize;
 
         for model_path in vvm_files {
-            let model = match VoiceModelFile::open(&model_path).await {
-                Ok(model) => model,
-                Err(e) => {
-                    metadata_open_failed += 1;
-                    warn!(
-                        "failed to open VVM '{}' for metadata: {}; skipping",
-                        model_path.display(),
-                        e
-                    );
-                    continue;
-                }
-            };
+            let model = VoiceModelFile::open(&model_path)
+                .await
+                .map_err(|e| format!("failed to open VVM '{}': {e}", model_path.display()))?;
 
             let style_ids = Self::collect_style_ids(model.metas());
             if style_ids.is_empty() {
@@ -701,16 +1072,9 @@ impl CoreRuntime {
 
         if discovered.is_empty() {
             return Err(format!(
-                "no usable style IDs were found in VVM files under '{}' (metadata_open_failed={})",
-                config.vvm_dir, metadata_open_failed
+                "no usable style IDs were found in VVM files under '{}'",
+                config.vvm_dir
             ));
-        }
-
-        if metadata_open_failed > 0 {
-            warn!(
-                "skipped {} VVM file(s) because metadata could not be read",
-                metadata_open_failed
-            );
         }
 
         let selected_version = version_counts
@@ -731,14 +1095,34 @@ impl CoreRuntime {
             );
         }
 
-        let discovered_total = discovered.len();
-        let selected_models = discovered
-            .into_iter()
-            .filter(|model| model.version_key == selected_version)
-            .collect::<Vec<_>>();
-        let skipped_models = discovered_total.saturating_sub(selected_models.len());
+        let mut style_to_model = HashMap::new();
+        let mut selected_model_paths = HashSet::new();
+        let mut skipped_models = 0usize;
 
-        if selected_models.is_empty() {
+        for discovered_model in discovered {
+            if discovered_model.version_key != selected_version {
+                skipped_models += 1;
+                continue;
+            }
+
+            selected_model_paths.insert(discovered_model.model_path.clone());
+
+            for style_id in &discovered_model.style_ids {
+                if let Some(prev) =
+                    style_to_model.insert(*style_id, discovered_model.model_path.clone())
+                    && prev != discovered_model.model_path
+                {
+                    warn!(
+                        "style id {} appears in multiple VVMs: '{}' and '{}'; using latest",
+                        style_id,
+                        prev.display(),
+                        discovered_model.model_path.display()
+                    );
+                }
+            }
+        }
+
+        if style_to_model.is_empty() {
             return Err(format!(
                 "no usable style IDs remained after version filtering under '{}'",
                 config.vvm_dir
@@ -758,63 +1142,19 @@ impl CoreRuntime {
             );
         }
 
-        let mut style_to_model = HashMap::new();
-        let mut loaded_models = 0usize;
-        let mut load_failed_models = 0usize;
+        for model_path in &selected_model_paths {
+            let model = VoiceModelFile::open(model_path).await.map_err(|e| {
+                format!(
+                    "failed to open VVM '{}' for loading: {e}",
+                    model_path.display()
+                )
+            })?;
 
-        for discovered_model in selected_models {
-            let model_path = &discovered_model.model_path;
-            let model = match VoiceModelFile::open(model_path).await {
-                Ok(model) => model,
-                Err(e) => {
-                    load_failed_models += 1;
-                    warn!(
-                        "failed to open VVM '{}' for loading: {}; skipping",
-                        model_path.display(),
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            if let Err(e) = synthesizer.load_voice_model(&model).perform().await {
-                load_failed_models += 1;
-                warn!(
-                    "failed to load VVM '{}': {}; skipping",
-                    model_path.display(),
-                    e
-                );
-                continue;
-            }
-
-            loaded_models += 1;
-
-            for style_id in &discovered_model.style_ids {
-                if let Some(prev) = style_to_model.insert(*style_id, model_path.clone())
-                    && prev != *model_path
-                {
-                    warn!(
-                        "style id {} appears in multiple VVMs: '{}' and '{}'; using latest",
-                        style_id,
-                        prev.display(),
-                        model_path.display()
-                    );
-                }
-            }
-        }
-
-        if style_to_model.is_empty() {
-            return Err(format!(
-                "failed to load any usable VVM under '{}' (metadata_open_failed={}, load_failed={})",
-                config.vvm_dir, metadata_open_failed, load_failed_models
-            ));
-        }
-
-        if load_failed_models > 0 {
-            warn!(
-                "skipped {} VVM file(s) because model loading failed",
-                load_failed_models
-            );
+            synthesizer
+                .load_voice_model(&model)
+                .perform()
+                .await
+                .map_err(|e| format!("failed to load VVM '{}': {e}", model_path.display()))?;
         }
 
         info!(
@@ -828,7 +1168,7 @@ impl CoreRuntime {
             config.output_sampling_rate,
             config.open_jtalk_dict_dir,
             config.vvm_dir,
-            loaded_models,
+            selected_model_paths.len(),
             style_to_model.len()
         );
 

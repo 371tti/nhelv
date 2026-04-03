@@ -80,8 +80,13 @@ impl Config {
             .unwrap_or_else(|_| "voicevox_core/dict/open_jtalk_dic_utf_8-1.11".to_string());
         let voicevox_vvm_dir = std::env::var("VOICEVOX_VVM_DIR")
             .unwrap_or_else(|_| "voicevox_core/models/vvms".to_string());
-        let voicevox_onnxruntime_filename =
-            std::env::var("VOICEVOX_ONNXRUNTIME_FILENAME").unwrap_or_else(|_| "".to_string());
+        let voicevox_onnxruntime_filename = std::env::var("VOICEVOX_ONNXRUNTIME_FILENAME")
+            .unwrap_or_else(|_| {
+                format!(
+                    "voicevox_core/onnxruntime/lib/{}",
+                    voicevox_core::blocking::Onnxruntime::LIB_VERSIONED_FILENAME
+                )
+            });
 
         Config {
             discord_token,
