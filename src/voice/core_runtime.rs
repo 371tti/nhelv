@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::{Cursor, Read},
+    io::Cursor,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -155,6 +155,30 @@ impl CoreRuntime {
             .map_err(|e| format!("failed to read downloaded asset bytes: {e}"))
     }
 
+    fn is_archive_asset(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower.ends_with(".tgz") || lower.ends_with(".tar.gz")
+    }
+
+    fn strip_first_archive_component(raw_path: &Path) -> Result<PathBuf, String> {
+        let mut stripped = PathBuf::new();
+
+        for component in raw_path.components().skip(1) {
+            match component {
+                std::path::Component::Normal(value) => stripped.push(value),
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "archive entry contains unsupported path component: '{}'",
+                        raw_path.display()
+                    ));
+                }
+            }
+        }
+
+        Ok(stripped)
+    }
+
     fn extract_tgz_strip_first_dir(archive: &[u8], output_root: &Path) -> Result<(), String> {
         let mut tar = tar::Archive::new(GzDecoder::new(Cursor::new(archive)));
 
@@ -165,16 +189,12 @@ impl CoreRuntime {
         for entry in entries {
             let mut entry = entry.map_err(|e| format!("failed to read tgz entry: {e}"))?;
 
-            if !entry.header().entry_type().is_file() {
-                continue;
-            }
-
             let raw_path = entry
                 .path()
                 .map_err(|e| format!("failed to read tgz entry path: {e}"))?
                 .into_owned();
 
-            let stripped = raw_path.components().skip(1).collect::<PathBuf>();
+            let stripped = Self::strip_first_archive_component(&raw_path)?;
             if stripped.as_os_str().is_empty() {
                 continue;
             }
@@ -189,54 +209,239 @@ impl CoreRuntime {
                 })?;
             }
 
-            let mut content = Vec::new();
             entry
-                .read_to_end(&mut content)
-                .map_err(|e| format!("failed to read tgz entry bytes: {e}"))?;
-            std::fs::write(&dst, content)
-                .map_err(|e| format!("failed to write extracted file '{}': {e}", dst.display()))?;
+                .unpack(&dst)
+                .map_err(|e| format!("failed to unpack tgz entry to '{}': {e}", dst.display()))?;
         }
 
         Ok(())
     }
 
-    fn select_onnxruntime_asset_name(release: &GithubRelease) -> Option<String> {
-        let mut preferred_prefixes: Vec<&str> = match (std::env::consts::OS, std::env::consts::ARCH)
-        {
-            ("windows", "x86_64") => vec![
-                "voicevox_onnxruntime-win-x64-dml-",
-                "voicevox_onnxruntime-win-x64-",
-            ],
-            ("windows", "x86") => vec!["voicevox_onnxruntime-win-x86-"],
-            ("linux", "x86_64") => vec![
-                "voicevox_onnxruntime-linux-x64-",
-                "voicevox_onnxruntime-linux-x64-cuda-",
-            ],
-            ("linux", "aarch64") => vec!["voicevox_onnxruntime-linux-arm64-"],
-            ("macos", "x86_64") => vec!["voicevox_onnxruntime-osx-x86_64-"],
-            ("macos", "aarch64") => vec!["voicevox_onnxruntime-osx-arm64-"],
-            _ => vec![],
-        };
+    fn try_find_asset_by_prefix<'a>(
+        release: &'a GithubRelease,
+        prefix: &str,
+        excluded_contains: &[&str],
+    ) -> Option<&'a GithubAsset> {
+        let prefix_lower = prefix.to_ascii_lowercase();
+        release.assets.iter().find(|asset| {
+            if !Self::is_archive_asset(&asset.name) {
+                return false;
+            }
 
-        if preferred_prefixes.is_empty() {
-            preferred_prefixes.push("voicevox_onnxruntime-");
-        }
+            let name = asset.name.to_ascii_lowercase();
+            if !name.starts_with(&prefix_lower) {
+                return false;
+            }
 
-        for prefix in preferred_prefixes {
-            if let Some(asset) = release.assets.iter().find(|asset| {
-                asset.name.starts_with(prefix)
-                    && (asset.name.ends_with(".tgz") || asset.name.ends_with(".tar.gz"))
-            }) {
-                return Some(asset.name.clone());
+            !excluded_contains.iter().any(|needle| name.contains(needle))
+        })
+    }
+
+    fn onnxruntime_asset_candidates(release: &GithubRelease) -> Vec<String> {
+        release
+            .assets
+            .iter()
+            .filter(|asset| Self::is_archive_asset(&asset.name))
+            .map(|asset| asset.name.clone())
+            .collect()
+    }
+
+    fn is_managed_onnxruntime_root(path: &Path) -> bool {
+        let mut has_voicevox_core = false;
+        let mut tail_is_onnxruntime = false;
+
+        for component in path.components() {
+            if let std::path::Component::Normal(value) = component {
+                if value == "voicevox_core" {
+                    has_voicevox_core = true;
+                }
+                tail_is_onnxruntime = value == "onnxruntime";
             }
         }
 
-        None
+        has_voicevox_core && tail_is_onnxruntime
     }
 
-    async fn ensure_voicevox_onnxruntime(config: &VoiceCoreConfig) -> Result<(), String> {
+    fn env_preview(name: &str, max_len: usize) -> String {
+        match std::env::var(name) {
+            Ok(value) => {
+                if value.len() <= max_len {
+                    value
+                } else {
+                    format!(
+                        "{}...(truncated, total_len={})",
+                        &value[..max_len],
+                        value.len()
+                    )
+                }
+            }
+            Err(err) => format!("<{}>", err),
+        }
+    }
+
+    fn path_status(path: &Path) -> String {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                let kind = if meta.file_type().is_symlink() {
+                    "symlink"
+                } else if meta.is_dir() {
+                    "dir"
+                } else if meta.is_file() {
+                    "file"
+                } else {
+                    "other"
+                };
+
+                let link_target = if meta.file_type().is_symlink() {
+                    std::fs::read_link(path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|e| format!("<readlink_error:{}>", e))
+                } else {
+                    "-".to_string()
+                };
+
+                let canonical = std::fs::canonicalize(path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("<canonicalize_error:{}>", e));
+
+                format!(
+                    "exists(kind={}, size={}, readonly={}, canonical='{}', symlink_target='{}')",
+                    kind,
+                    meta.len(),
+                    meta.permissions().readonly(),
+                    canonical,
+                    link_target
+                )
+            }
+            Err(err) => format!("missing(metadata_error={})", err),
+        }
+    }
+
+    fn dir_preview(dir: &Path, limit: usize) -> String {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => return format!("<read_dir_error:{}>", err),
+        };
+
+        let mut names = Vec::new();
+        for entry in entries.flatten().take(limit) {
+            let path = entry.path();
+            let mut name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<non-utf8>")
+                .to_string();
+
+            if path.is_dir() {
+                name.push('/');
+            }
+            names.push(name);
+        }
+
+        if names.is_empty() {
+            "<empty>".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    fn build_onnxruntime_failure_diagnostics(
+        config: &VoiceCoreConfig,
+        candidates: &[String],
+    ) -> String {
         let configured_path = PathBuf::from(&config.onnxruntime_filename);
-        if configured_path.is_file() {
+        let lib_dir = configured_path.parent().map(Path::to_path_buf);
+        let onnxruntime_root = lib_dir
+            .as_deref()
+            .and_then(|dir| dir.parent())
+            .map(Path::to_path_buf);
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("<cwd_error:{}>", e));
+
+        let lib_dir_preview = lib_dir
+            .as_deref()
+            .map(|dir| Self::dir_preview(dir, 20))
+            .unwrap_or_else(|| "<none>".to_string());
+        let root_preview = onnxruntime_root
+            .as_deref()
+            .map(|dir| Self::dir_preview(dir, 20))
+            .unwrap_or_else(|| "<none>".to_string());
+
+        format!(
+            "cwd='{}'; configured='{}' ({}) ; lib_dir='{}' ({}); root='{}' ({}); candidates=[{}]; LD_LIBRARY_PATH='{}'; PATH='{}'",
+            cwd,
+            configured_path.display(),
+            Self::path_status(&configured_path),
+            lib_dir
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            lib_dir_preview,
+            onnxruntime_root
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            root_preview,
+            candidates.join(", "),
+            Self::env_preview("LD_LIBRARY_PATH", 400),
+            Self::env_preview("PATH", 400)
+        )
+    }
+
+    fn select_onnxruntime_asset_name(release: &GithubRelease) -> Option<String> {
+        let picked = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("windows", "x86_64") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-win-x64-dml-", &[])
+                    .or_else(|| {
+                        Self::try_find_asset_by_prefix(
+                            release,
+                            "voicevox_onnxruntime-win-x64-",
+                            &["-dml-"],
+                        )
+                    })
+            }
+            ("windows", "x86") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-win-x86-", &[])
+            }
+            ("linux", "x86_64") => {
+                // Linux x64 はまずCPU版を優先する。
+                // ここを単純 starts_with("...linux-x64-") にすると "...linux-x64-cuda-"
+                // までマッチしてしまい、CUDA非対応環境で初期化に失敗しやすい。
+                Self::try_find_asset_by_prefix(
+                    release,
+                    "voicevox_onnxruntime-linux-x64-",
+                    &["-cuda-"],
+                )
+                .or_else(|| {
+                    Self::try_find_asset_by_prefix(
+                        release,
+                        "voicevox_onnxruntime-linux-x64-cuda-",
+                        &[],
+                    )
+                })
+            }
+            ("linux", "aarch64") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-linux-arm64-", &[])
+            }
+            ("macos", "x86_64") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-osx-x86_64-", &[])
+            }
+            ("macos", "aarch64") => {
+                Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-osx-arm64-", &[])
+            }
+            _ => Self::try_find_asset_by_prefix(release, "voicevox_onnxruntime-", &[]),
+        };
+
+        picked.map(|asset| asset.name.clone())
+    }
+
+    async fn ensure_voicevox_onnxruntime(
+        config: &VoiceCoreConfig,
+        force_refresh: bool,
+    ) -> Result<(), String> {
+        let configured_path = PathBuf::from(&config.onnxruntime_filename);
+        if configured_path.is_file() && !force_refresh {
             return Ok(());
         }
 
@@ -254,6 +459,26 @@ impl CoreRuntime {
             )
         })?;
 
+        if force_refresh && onnxruntime_root.exists() {
+            if Self::is_managed_onnxruntime_root(onnxruntime_root) {
+                std::fs::remove_dir_all(onnxruntime_root).map_err(|e| {
+                    format!(
+                        "failed to remove ONNX Runtime directory '{}' before refresh: {e}",
+                        onnxruntime_root.display()
+                    )
+                })?;
+            } else {
+                warn!(
+                    "skip ONNX Runtime force-refresh cleanup for unmanaged path '{}'",
+                    onnxruntime_root.display()
+                );
+                return Err(format!(
+                    "refusing force refresh for unmanaged ONNX Runtime path '{}'",
+                    onnxruntime_root.display()
+                ));
+            }
+        }
+
         std::fs::create_dir_all(onnxruntime_root).map_err(|e| {
             format!(
                 "failed to create ONNX Runtime root directory '{}': {e}",
@@ -262,16 +487,25 @@ impl CoreRuntime {
         })?;
 
         info!(
-            "VOICEVOX ONNX Runtime not found at '{}'; downloading from '{}'",
+            "VOICEVOX ONNX Runtime {} at '{}'; downloading from '{}'",
+            if force_refresh {
+                "refresh requested"
+            } else {
+                "not found"
+            },
             configured_path.display(),
             ONNXRUNTIME_BUILDER_REPO
         );
 
         let release = Self::fetch_latest_release(ONNXRUNTIME_BUILDER_REPO).await?;
         let asset_name = Self::select_onnxruntime_asset_name(&release).ok_or_else(|| {
+            let available = Self::onnxruntime_asset_candidates(&release);
             format!(
-                "no matching ONNX Runtime archive for current platform in release '{}'",
-                release.tag_name
+                "no matching ONNX Runtime archive for current platform in release '{}'. os='{}' arch='{}' available_assets={:?}",
+                release.tag_name,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                available
             )
         })?;
 
@@ -507,7 +741,7 @@ impl CoreRuntime {
         let dict_dir = PathBuf::from(&config.open_jtalk_dict_dir);
         let vvm_dir = PathBuf::from(&config.vvm_dir);
 
-        Self::ensure_voicevox_onnxruntime(config).await?;
+        Self::ensure_voicevox_onnxruntime(config, false).await?;
         Self::ensure_open_jtalk_dictionary(&dict_dir).await?;
         Self::ensure_vvm_models(&vvm_dir).await?;
 
@@ -525,6 +759,47 @@ impl CoreRuntime {
         }
 
         Ok(())
+    }
+
+    async fn try_load_onnxruntime_candidates(
+        candidates: &[String],
+    ) -> Result<&'static Onnxruntime, Vec<String>> {
+        let mut tried = Vec::new();
+
+        for (idx, candidate) in candidates.iter().enumerate() {
+            match Onnxruntime::load_once().filename(candidate).perform().await {
+                Ok(ort) => {
+                    if idx > 0 {
+                        warn!(
+                            "ONNX Runtime init fallback succeeded with filename='{}'",
+                            candidate
+                        );
+                    }
+                    return Ok(ort);
+                }
+                Err(e) => {
+                    let path = PathBuf::from(candidate);
+                    let file_hint = if path.components().count() > 1 || path.is_absolute() {
+                        match std::fs::metadata(&path) {
+                            Ok(meta) => {
+                                format!(
+                                    "exists(size={}, readonly={})",
+                                    meta.len(),
+                                    meta.permissions().readonly()
+                                )
+                            }
+                            Err(err) => format!("metadata_error={}", err),
+                        }
+                    } else {
+                        "search_path_candidate".to_string()
+                    };
+
+                    tried.push(format!("{} [{}] => {}", candidate, file_hint, e));
+                }
+            }
+        }
+
+        Err(tried)
     }
 
     fn parse_acceleration_mode(mode: &str) -> AccelerationMode {
@@ -568,30 +843,78 @@ impl CoreRuntime {
             candidates.push(default_unversioned);
         }
 
-        let mut tried = Vec::new();
-        for (idx, candidate) in candidates.into_iter().enumerate() {
-            match Onnxruntime::load_once()
-                .filename(&candidate)
-                .perform()
-                .await
-            {
-                Ok(ort) => {
-                    if idx > 0 {
-                        warn!(
-                            "ONNX Runtime init fallback succeeded with filename='{}'",
-                            candidate
-                        );
+        let diagnostic = Self::build_onnxruntime_failure_diagnostics(config, &candidates);
+
+        match Self::try_load_onnxruntime_candidates(&candidates).await {
+            Ok(ort) => return Ok(ort),
+            Err(initial_errors) => {
+                let mut refresh_result = "not_attempted".to_string();
+                let mut refresh_retry_errors = Vec::new();
+
+                if std::env::consts::OS == "linux" {
+                    let configured_path = PathBuf::from(&config.onnxruntime_filename);
+                    let onnxruntime_root = configured_path
+                        .parent()
+                        .and_then(|lib_dir| lib_dir.parent())
+                        .map(Path::to_path_buf);
+
+                    let can_force_refresh = onnxruntime_root
+                        .as_deref()
+                        .map(Self::is_managed_onnxruntime_root)
+                        .unwrap_or(false);
+
+                    warn!(
+                        "ONNX Runtime init failed on Linux. candidates={} force_refresh_allowed={} root={}",
+                        candidates.join(", "),
+                        can_force_refresh,
+                        onnxruntime_root
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string())
+                    );
+
+                    if can_force_refresh {
+                        match Self::ensure_voicevox_onnxruntime(config, true).await {
+                            Ok(()) => {
+                                match Self::try_load_onnxruntime_candidates(&candidates).await {
+                                    Ok(ort) => {
+                                        warn!(
+                                            "ONNX Runtime init succeeded after forced asset refresh on Linux"
+                                        );
+                                        return Ok(ort);
+                                    }
+                                    Err(retry_errors) => {
+                                        refresh_result =
+                                            "refresh_download_ok_but_retry_failed".to_string();
+                                        refresh_retry_errors = retry_errors;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                refresh_result = format!("refresh_download_failed(error={})", err);
+                            }
+                        }
+                    } else {
+                        refresh_result = "refresh_skipped_unmanaged_path".to_string();
                     }
-                    return Ok(ort);
                 }
-                Err(e) => tried.push(format!("{} => {}", candidate, e)),
+
+                return Err(format!(
+                    "failed to initialize ONNX Runtime (os='{}', arch='{}', configured='{}', checked candidates: {}, refresh_result='{}', refresh_retry_errors='{}', diagnostics={})",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    config.onnxruntime_filename,
+                    initial_errors.join(" | "),
+                    refresh_result,
+                    if refresh_retry_errors.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        refresh_retry_errors.join(" | ")
+                    },
+                    diagnostic
+                ));
             }
         }
-
-        Err(format!(
-            "failed to initialize ONNX Runtime (checked candidates: {})",
-            tried.join(" | ")
-        ))
     }
 
     fn discover_vvm_files(vvm_dir: &Path) -> Result<Vec<PathBuf>, String> {
