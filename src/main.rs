@@ -5,6 +5,10 @@ async fn main() {
     dotenv::dotenv().ok();
     env_logger::try_init_from_env(env_logger::Env::default().default_filter_or("debug"))
         .unwrap_or(());
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
 
     // コンテキスト初期化
     let ob_ctx = NelfieContext::new().await;

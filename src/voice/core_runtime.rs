@@ -98,7 +98,11 @@ impl VoiceVoxInitDownloader {
             return Ok(());
         }
 
-        if Self::has_auto_discoverable_onnxruntime_library() {
+        if Self::has_preferred_onnxruntime_library() {
+            return Ok(());
+        }
+
+        if Self::sync_auto_discovered_onnxruntime_into_preferred_dir()? {
             return Ok(());
         }
 
@@ -142,9 +146,9 @@ impl VoiceVoxInitDownloader {
             ));
         }
 
-        if !Self::has_auto_discoverable_onnxruntime_library() {
+        if !Self::has_preferred_onnxruntime_library() {
             return Err(format!(
-                "ONNX Runtime download completed, but '{}' is still unavailable in auto-discovery paths",
+                "ONNX Runtime download completed, but '{}' is still unavailable in preferred paths",
                 Onnxruntime::LIB_VERSIONED_FILENAME
             ));
         }
@@ -159,13 +163,63 @@ impl VoiceVoxInitDownloader {
         Ok(())
     }
 
-    fn has_auto_discoverable_onnxruntime_library() -> bool {
-        CoreRuntime::onnxruntime_search_dirs()
+    fn has_preferred_onnxruntime_library() -> bool {
+        Self::preferred_onnxruntime_download_dirs()
             .into_iter()
             .any(|dir| {
                 dir.join(Onnxruntime::LIB_VERSIONED_FILENAME).is_file()
                     || dir.join(Onnxruntime::LIB_UNVERSIONED_FILENAME).is_file()
             })
+    }
+
+    fn sync_auto_discovered_onnxruntime_into_preferred_dir() -> Result<bool, String> {
+        let Some(source_dir) = CoreRuntime::onnxruntime_search_dirs()
+            .into_iter()
+            .find(|dir| {
+                dir.join(Onnxruntime::LIB_VERSIONED_FILENAME).is_file()
+                    || dir.join(Onnxruntime::LIB_UNVERSIONED_FILENAME).is_file()
+            })
+        else {
+            return Ok(false);
+        };
+
+        let output_dir = Self::choose_onnxruntime_download_dir()?;
+        let mut copied = 0usize;
+
+        for filename in [
+            Onnxruntime::LIB_VERSIONED_FILENAME,
+            Onnxruntime::LIB_UNVERSIONED_FILENAME,
+        ] {
+            let src = source_dir.join(filename);
+            if !src.is_file() {
+                continue;
+            }
+
+            let dst = output_dir.join(filename);
+            if src == dst {
+                continue;
+            }
+
+            std::fs::copy(&src, &dst).map_err(|e| {
+                format!(
+                    "failed to copy ONNX Runtime file from '{}' to '{}': {}",
+                    src.display(),
+                    dst.display(),
+                    e
+                )
+            })?;
+            copied += 1;
+        }
+
+        if copied > 0 {
+            info!(
+                "ONNX Runtime was found in '{}' and copied to preferred directory '{}'",
+                source_dir.display(),
+                output_dir.display()
+            );
+        }
+
+        Ok(Self::has_preferred_onnxruntime_library())
     }
 
     fn onnxruntime_release_tag() -> String {
@@ -209,14 +263,14 @@ impl VoiceVoxInitDownloader {
         if let Ok(current_dir) = std::env::current_dir() {
             CoreRuntime::push_unique_path(
                 &mut dirs,
+                current_dir.join("voicevox_core").join("onnxruntime"),
+            );
+            CoreRuntime::push_unique_path(
+                &mut dirs,
                 current_dir
                     .join("voicevox_core")
                     .join("onnxruntime")
                     .join("lib"),
-            );
-            CoreRuntime::push_unique_path(
-                &mut dirs,
-                current_dir.join("voicevox_core").join("onnxruntime"),
             );
             CoreRuntime::push_unique_path(&mut dirs, current_dir.join("voicevox_core"));
             CoreRuntime::push_unique_path(&mut dirs, current_dir);
@@ -228,14 +282,14 @@ impl VoiceVoxInitDownloader {
             let executable_dir = executable_dir.to_path_buf();
             CoreRuntime::push_unique_path(
                 &mut dirs,
+                executable_dir.join("voicevox_core").join("onnxruntime"),
+            );
+            CoreRuntime::push_unique_path(
+                &mut dirs,
                 executable_dir
                     .join("voicevox_core")
                     .join("onnxruntime")
                     .join("lib"),
-            );
-            CoreRuntime::push_unique_path(
-                &mut dirs,
-                executable_dir.join("voicevox_core").join("onnxruntime"),
             );
             CoreRuntime::push_unique_path(&mut dirs, executable_dir.join("voicevox_core"));
             CoreRuntime::push_unique_path(&mut dirs, executable_dir);
@@ -1320,6 +1374,8 @@ impl CoreRuntime {
         // Discord向け品質を優先して出力条件を固定する。
         query.output_sampling_rate = self.output_sampling_rate;
         query.output_stereo = false;
+        query.post_phoneme_length = 0.05;
+        query.pre_phoneme_length = 0.05;
 
         if let Some(speed_scale) = speed_scale {
             query.speed_scale = speed_scale;

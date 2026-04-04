@@ -43,7 +43,7 @@ impl Config {
 すべて生成してから応答するのではなくtoolで順次思考内容を伝えたりするのはとても良いです。
 たのしく会話してくださいね。
 あなたの名前はNelfie(ネルフィー)ですよ。
-あと絵文字つかわないで　つかうなら顔文字つかうように
+あと絵文字つかわないで つかうなら顔文字つかうように
 ハイテンションやめておちついてほしい
 ".to_string());
         let voicevox_default_speaker = std::env::var("VOICEVOX_DEFAULT_SPEAKER")

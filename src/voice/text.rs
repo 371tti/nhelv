@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{FixedOffset, TimeZone, Utc};
 use kanalizer::{ConvertOptions, Kanalizer};
 use once_cell::sync::Lazy;
@@ -37,8 +39,6 @@ static RE_SUBTEXT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\s*-#(?:\s+.*)?$
 static RE_BLOCKQUOTE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\s*>>?>\s?").unwrap());
 
 static RE_LIST: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\s*(?:[-*]|\d+\.)\s+").unwrap());
-
-static RE_WS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
 const TTS_SEGMENT_SOFT_LIMIT: usize = 36;
 const TTS_SEGMENT_HARD_LIMIT: usize = 60;
@@ -92,6 +92,10 @@ impl EN2KANA {
         }
     }
 
+    fn should_skip_kanalyze_ascii_word(word: &str) -> bool {
+        !word.is_empty() && word.len() <= 5 && word.bytes().all(|b| b.is_ascii_uppercase())
+    }
+
     fn convert_ascii_alnum_run(&self, run: &str, opt: &ConvertOptions) -> Result<String, String> {
         let bytes = run.as_bytes();
         let has_alpha = bytes.iter().any(|b| b.is_ascii_alphabetic());
@@ -110,7 +114,13 @@ impl EN2KANA {
                     i += 1;
                 }
 
-                let normalized = Self::normalize_ascii_letters(&run[start..i]);
+                let alpha_word = &run[start..i];
+                if Self::should_skip_kanalyze_ascii_word(alpha_word) {
+                    result.push_str(alpha_word);
+                    continue;
+                }
+
+                let normalized = Self::normalize_ascii_letters(alpha_word);
                 let converted = self
                     .decoder
                     .convert(&normalized, opt)
@@ -134,6 +144,14 @@ impl EN2KANA {
     }
 
     pub fn convert(&self, src: &str, opt: Option<ConvertOptions>) -> Result<String, String> {
+        if src.is_empty() {
+            return Ok(String::new());
+        }
+
+        if !src.as_bytes().iter().any(|b| b.is_ascii_alphabetic()) {
+            return Ok(src.to_string());
+        }
+
         let opt = opt.unwrap_or_default();
         let mut result = String::with_capacity(src.len());
         let bytes = src.as_bytes();
@@ -237,48 +255,54 @@ pub fn normalize_tts_text(input: &str) -> String {
     let mut out = input.to_string();
 
     // [text](url) -> text
-    out = RE_MASKED_LINK.replace_all(&out, "$1").into_owned();
+    if out.contains("](") {
+        out = regex_replace_all(out, &RE_MASKED_LINK, "$1");
+    }
 
     // ```...``` -> コードブロック
-    out = RE_CODE_BLOCK
-        .replace_all(&out, "コードブロック")
-        .into_owned();
+    if out.contains("```") {
+        out = regex_replace_all(out, &RE_CODE_BLOCK, "コードブロック");
+    }
 
     // `...` -> コード
-    out = RE_INLINE_CODE.replace_all(&out, "コード").into_owned();
+    if out.contains('`') {
+        out = regex_replace_all(out, &RE_INLINE_CODE, "コード");
+    }
 
     // ||...|| -> ネタバレあり
-    out = RE_SPOILER
-        .replace_all(&out, |_caps: &Captures| "スポイラー".to_string())
-        .into_owned();
+    if out.contains("||") {
+        out = regex_replace_all_with(out, &RE_SPOILER, |_caps: &Captures| {
+            "スポイラー".to_string()
+        });
+    }
 
     // </foo:123> / </foo bar:123> -> スラッシュコマンド foo / foo bar
-    out = RE_SLASH_COMMAND
-        .replace_all(&out, |caps: &Captures| {
+    if out.contains("</") {
+        out = regex_replace_all_with(out, &RE_SLASH_COMMAND, |caps: &Captures| {
             let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
             if name.is_empty() {
                 "スラッシュコマンド".to_string()
             } else {
                 format!("スラッシュコマンド {}", name)
             }
-        })
-        .into_owned();
+        });
+    }
 
     // <:name:id> / <a:name:id> -> 絵文字 name
-    out = RE_CUSTOM_EMOJI
-        .replace_all(&out, |caps: &Captures| {
+    if out.contains("<:") || out.contains("<a:") {
+        out = regex_replace_all_with(out, &RE_CUSTOM_EMOJI, |caps: &Captures| {
             let name = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
             if name.is_empty() {
                 "絵文字".to_string()
             } else {
                 format!("絵文字 {}", name)
             }
-        })
-        .into_owned();
+        });
+    }
 
     // <t:1618953630:R> -> 相対時刻 / 日時
-    out = RE_TIMESTAMP
-        .replace_all(&out, |caps: &Captures| {
+    if out.contains("<t:") {
+        out = regex_replace_all_with(out, &RE_TIMESTAMP, |caps: &Captures| {
             let ts = caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok());
 
             let style = caps.get(2).map(|m| m.as_str());
@@ -287,26 +311,39 @@ pub fn normalize_tts_text(input: &str) -> String {
                 Some(ts) => format_timestamp_for_tts(ts, style),
                 None => "日時".to_string(),
             }
-        })
-        .into_owned();
+        });
+    }
 
     // <id:guide> など
-    out = RE_GUILD_NAV
-        .replace_all(&out, "サーバー内リンク")
-        .into_owned();
+    if out.contains("<id:") {
+        out = regex_replace_all(out, &RE_GUILD_NAV, "サーバー内リンク");
+    }
 
     // URL
-    out = RE_URL.replace_all(&out, "URL").into_owned();
+    if out.contains("http://") || out.contains("https://") {
+        out = regex_replace_all(out, &RE_URL, "URL");
+    }
 
     // Markdown 記号のうち読み上げ不要なもの
-    out = RE_HEADER.replace_all(&out, "").into_owned();
-    out = RE_SUBTEXT.replace_all(&out, "").into_owned();
-    out = RE_BLOCKQUOTE.replace_all(&out, "").into_owned();
-    out = RE_LIST.replace_all(&out, "").into_owned();
+    if out.contains('#') {
+        out = regex_replace_all(out, &RE_HEADER, "");
+    }
+    if out.contains("-#") {
+        out = regex_replace_all(out, &RE_SUBTEXT, "");
+    }
+    if out.contains('>') {
+        out = regex_replace_all(out, &RE_BLOCKQUOTE, "");
+    }
+    if out.contains('\n') || out.starts_with("- ") || out.starts_with("* ") {
+        out = regex_replace_all(out, &RE_LIST, "");
+    }
 
     // 改行・連続空白を畳む
-    out = RE_WS.replace_all(&out, " ").into_owned();
-    out = out.trim().to_string();
+    out = collapse_whitespace_for_tts(&out);
+
+    // <数字>.<数字> / .<数字> は「テン」読みとして扱い、
+    // 小数点以下は桁読み（例: .32 -> テンサンニイ）に固定する。
+    out = normalize_decimal_points_for_tts(&out);
 
     // OpenJTalk/VOICEVOX で句頭に置くと壊れやすい記号を落とす
     out = strip_unsafe_head_symbols_for_tts(&out);
@@ -331,7 +368,7 @@ pub fn split_tts_segments(input: &str) -> Vec<String> {
     }
 
     let mut segments = Vec::new();
-    let mut current = String::new();
+    let mut current = String::with_capacity(TTS_SEGMENT_HARD_LIMIT + 8);
     let mut current_len = 0usize;
 
     for ch in trimmed.chars() {
@@ -550,13 +587,156 @@ fn strip_unsafe_head_symbols_for_tts(input: &str) -> String {
         }
     }
 
-    out.trim().to_string()
+    let trimmed_len = out.trim_end().len();
+    if trimmed_len != out.len() {
+        out.truncate(trimmed_len);
+    }
+
+    out
 }
 
 fn normalize_ascii_alnum_to_kana(input: &str) -> String {
+    if !input.as_bytes().iter().any(|b| b.is_ascii_alphabetic()) {
+        return input.to_string();
+    }
+
     EN2KANA_DECODER.with(|decoder| {
         decoder
             .convert(input, None)
             .unwrap_or_else(|_| input.to_string())
     })
+}
+
+fn normalize_decimal_points_for_tts(input: &str) -> String {
+    if !input.as_bytes().contains(&b'.') {
+        return input.to_string();
+    }
+
+    let mut out = String::with_capacity(input.len() + 8);
+    let mut chars = input.chars().peekable();
+    let mut prev_char: Option<char> = None;
+    let mut changed = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '.' {
+            let next_is_digit = chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false);
+            let left_is_decimal_ok = match prev_char {
+                None => true,
+                Some(prev) => prev.is_ascii_digit() || !prev.is_ascii_alphanumeric(),
+            };
+
+            if next_is_digit && left_is_decimal_ok {
+                out.push_str("テン");
+                changed = true;
+
+                let mut consumed = false;
+                while let Some(next) = chars.peek().copied() {
+                    if !next.is_ascii_digit() {
+                        break;
+                    }
+
+                    out.push_str(digit_to_decimal_kana(next));
+                    chars.next();
+                    consumed = true;
+                }
+
+                if consumed {
+                    prev_char = Some('0');
+                }
+                continue;
+            }
+        }
+
+        out.push(ch);
+        prev_char = Some(ch);
+    }
+
+    if changed { out } else { input.to_string() }
+}
+
+fn digit_to_decimal_kana(digit: char) -> &'static str {
+    match digit {
+        '0' => "ゼロ",
+        '1' => "イチ",
+        '2' => "ニイ",
+        '3' => "サン",
+        '4' => "ヨン",
+        '5' => "ゴ",
+        '6' => "ロク",
+        '7' => "ナナ",
+        '8' => "ハチ",
+        '9' => "キュウ",
+        _ => "",
+    }
+}
+
+fn collapse_whitespace_for_tts(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_was_space = true;
+
+    for ch in input.chars() {
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+            continue;
+        }
+
+        out.push(ch);
+        prev_was_space = false;
+    }
+
+    if out.ends_with(' ') {
+        out.pop();
+    }
+
+    out
+}
+
+fn regex_replace_all(text: String, re: &Regex, replacement: &str) -> String {
+    match re.replace_all(&text, replacement) {
+        Cow::Borrowed(_) => text,
+        Cow::Owned(owned) => owned,
+    }
+}
+
+fn regex_replace_all_with(
+    text: String,
+    re: &Regex,
+    mut replacer: impl FnMut(&Captures) -> String,
+) -> String {
+    match re.replace_all(&text, |caps: &Captures| replacer(caps)) {
+        Cow::Borrowed(_) => text,
+        Cow::Owned(owned) => owned,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_uppercase_ascii_word_is_skipped_for_kanalyze() {
+        assert!(EN2KANA::should_skip_kanalyze_ascii_word("CPU"));
+        assert!(EN2KANA::should_skip_kanalyze_ascii_word("ABCDE"));
+        assert!(!EN2KANA::should_skip_kanalyze_ascii_word("ABCDEF"));
+        assert!(!EN2KANA::should_skip_kanalyze_ascii_word("Gpu"));
+    }
+
+    #[test]
+    fn convert_keeps_short_uppercase_ascii_word() {
+        let conv = EN2KANA::new();
+        let out = conv
+            .convert("CPU usage", None)
+            .expect("EN2KANA conversion should succeed");
+
+        assert!(out.contains("CPU"));
+    }
+
+    #[test]
+    fn decimal_fraction_is_read_digit_by_digit() {
+        assert_eq!(normalize_tts_text(".32"), "テンサンニイ");
+        assert_eq!(normalize_tts_text("1.32"), "1テンサンニイ");
+    }
 }
