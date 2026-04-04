@@ -42,11 +42,7 @@ songbird = { git = "https://github.com/serenity-rs/songbird", branch = "next", f
     "builtin-queue",
     "rustls",
 ] }
-rustls = { version = "0.23.37", default-features = false, features = [
-    "ring",
-    "std",
-    "tls12",
-] }
+rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
 voicevox_core = { git = "https://github.com/VOICEVOX/voicevox_core", package = "voicevox_core", features = [
     "load-onnxruntime",
     "buildtime-download-onnxruntime",
